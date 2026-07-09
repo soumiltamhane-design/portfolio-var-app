@@ -34,40 +34,82 @@ CACHE_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def load_prices(file_bytes: bytes, filename: str) -> pd.DataFrame:
+def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
+                 date_col_letter: str = "A", fill_method: str = "none") -> pd.DataFrame:
     """
-    Loads a wide dates x assets price file. Expects first column = date.
+    Loads a wide dates x assets price file.
+
+    header_row: the row number (1-indexed, as you'd see it in Excel) that
+        contains the asset codes/tickers. Everything above it is ignored.
+    date_col_letter: the Excel column letter that holds the dates (e.g. "A", "B").
+    fill_method: "none", "ffill" (carry last known price forward — the
+        correct choice for illiquid instruments like bonds that don't trade
+        every day), or "drop" (drop any row with missing values).
+
     Caches a Parquet copy so re-runs (or re-computes with different weights)
     skip the expensive Excel parse entirely.
     """
     suffix = Path(filename).suffix.lower()
-    cache_path = CACHE_DIR / f"{filename}.parquet"
+    cache_key = f"{filename}__h{header_row}_c{date_col_letter}_f{fill_method}"
+    cache_path = CACHE_DIR / f"{cache_key}.parquet"
 
     if cache_path.exists():
         return pd.read_parquet(cache_path)
 
     tmp_path = CACHE_DIR / f"_raw_{filename}"
-    tmp_path.write_bytes(file_bytes)
+    if not tmp_path.exists():
+        tmp_path.write_bytes(file_bytes)
 
     t0 = time.time()
     if suffix in (".xlsx", ".xlsm"):
-        df = pd.read_excel(tmp_path, index_col=0, engine="openpyxl")
+        # header_row is 1-indexed in Excel; pandas' `header=` is 0-indexed
+        df = pd.read_excel(tmp_path, header=header_row - 1, engine="openpyxl")
     elif suffix == ".csv":
-        df = pd.read_csv(tmp_path, index_col=0)
+        df = pd.read_csv(tmp_path, header=header_row - 1)
     elif suffix == ".parquet":
         df = pd.read_parquet(tmp_path)
     else:
         raise ValueError(f"Unsupported file type: {suffix}")
 
-    df.index = pd.to_datetime(df.index, errors="coerce")
+    # Resolve the date column: pandas gives generic column names for the
+    # header row we picked, so find the one matching the chosen letter.
+    if suffix != ".parquet":
+        col_idx = _excel_col_to_index(date_col_letter)
+        date_col_name = df.columns[col_idx]
+        df = df.rename(columns={date_col_name: "__date__"}).set_index("__date__")
+        # drop any other columns to the left of the date column that were just headers/blank
+        df = df.drop(columns=[c for c in df.columns if str(c).startswith("Unnamed") and df[c].isna().all()])
+
+    # dayfirst=True because Indian financial files use dd-mm-yyyy, not mm-dd-yyyy
+    df.index = pd.to_datetime(df.index, errors="coerce", dayfirst=True)
     df = df[df.index.notna()]
+    df = df.sort_index()
+
+    # "NA" text, blanks, dashes etc. all become proper missing values
+    df = df.replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
     df = df.apply(pd.to_numeric, errors="coerce")
 
+    # drop columns that are entirely empty (no trades ever recorded)
+    df = df.dropna(axis=1, how="all")
+
+    if fill_method == "ffill":
+        df = df.ffill()
+    elif fill_method == "drop":
+        df = df.dropna(axis=0, how="any")
+
     df.to_parquet(cache_path)
-    tmp_path.unlink(missing_ok=True)
 
     st.session_state["_last_load_seconds"] = round(time.time() - t0, 1)
     return df
+
+
+def _excel_col_to_index(letter: str) -> int:
+    """Converts an Excel column letter ('A', 'B', ..., 'AA', ...) to a 0-indexed position."""
+    letter = letter.strip().upper()
+    idx = 0
+    for ch in letter:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
 
 
 def make_synthetic_demo(n_days=1000, n_assets=8, seed=7) -> pd.DataFrame:
@@ -94,16 +136,36 @@ with st.sidebar:
     use_demo = st.checkbox("Use synthetic demo data instead of uploading", value=True)
 
     uploaded = None
+    header_row, date_col_letter, fill_method = 1, "A", "none"
     if not use_demo:
         uploaded = st.file_uploader(
             "Upload price file (dates x assets, wide format)",
-            type=["xlsx", "csv", "parquet"],
+            type=["xlsx", "xlsm", "csv", "parquet"],
         )
         st.caption(
-            "First column = date, remaining columns = one price series per asset. "
-            "Large .xlsx files are cached to Parquet after the first load — "
+            "Large .xlsx/.xlsm files are cached to Parquet after the first load — "
             "every recompute after that is instant."
         )
+
+        with st.expander("File layout settings (open this if your file has extra header rows, a different date column, or gaps like 'NA')"):
+            header_row = st.number_input(
+                "Which row has the asset names/codes (as seen in Excel)?",
+                min_value=1, value=1, step=1,
+            )
+            date_col_letter = st.text_input(
+                "Which column has the dates (Excel letter, e.g. A, B, C)?",
+                value="A",
+            )
+            fill_method = st.selectbox(
+                "How to handle missing/'NA' values?",
+                options=["none", "ffill", "drop"],
+                format_func=lambda x: {
+                    "none": "Leave as missing (default)",
+                    "ffill": "Carry forward last known price — use this for bonds/illiquid assets that don't trade daily",
+                    "drop": "Drop any date with a missing value in any asset",
+                }[x],
+                index=0,
+            )
 
     st.header("2. VaR settings")
     confidence = st.select_slider("Confidence level", options=[0.90, 0.95, 0.975, 0.99], value=0.95)
@@ -120,10 +182,13 @@ if use_demo:
     prices = make_synthetic_demo()
     st.info("Using synthetic demo data (8 correlated assets, 1000 trading days). Uncheck the box in the sidebar to upload your own file.")
 elif uploaded is not None:
-    prices = load_prices(uploaded.getvalue(), uploaded.name)
+    prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method)
     load_time = st.session_state.get("_last_load_seconds")
     if load_time:
         st.success(f"Loaded and cached to Parquet in {load_time}s. Future recomputes on this file will be instant.")
+    if prices.shape[1] == 0:
+        st.error("No asset columns were found. Double-check the header row and date column settings above.")
+        st.stop()
 else:
     st.warning("Upload a file or check 'use synthetic demo data' to continue.")
     st.stop()
