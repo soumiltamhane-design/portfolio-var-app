@@ -134,10 +134,18 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
     """
     Loads a 'long format' file: one row per (date, asset) pair, e.g. a daily
     holdings/valuation report where each security reappears on every date it
-    was held. Pulls ONLY the three needed columns (by Excel letter) instead
-    of the whole sheet — much faster on a large file with many unused columns.
-    Pivots into the same wide dates x assets shape the rest of the app expects.
+    was held. Pivots into the same wide dates x assets shape the rest of the
+    app expects.
+
+    Uses openpyxl in streaming read-only mode (iter_rows) rather than
+    pandas.read_excel. This matters a lot on large files: pandas' Excel
+    reader builds the full workbook object in memory regardless of usecols,
+    which can need 5-10x the file size in RAM — enough to crash a
+    memory-limited server on a 200MB+ file. Streaming mode reads one row at
+    a time and only keeps the 3 columns we actually need.
     """
+    import openpyxl
+
     tmp_path = CACHE_DIR / f"_raw_{filename}"
     if not tmp_path.exists():
         tmp_path.write_bytes(file_bytes)
@@ -148,12 +156,28 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
         return pd.read_parquet(cache_path)
 
     t0 = time.time()
-    usecols = f"{date_col_letter},{id_col_letter},{price_col_letter}"
-    df = pd.read_excel(
-        tmp_path, sheet_name=sheet_name, header=header_row - 1,
-        usecols=usecols, engine="openpyxl",
-    )
-    df.columns = ["date", "asset_id", "price"]
+
+    date_idx = _excel_col_to_index(date_col_letter)
+    id_idx = _excel_col_to_index(id_col_letter)
+    price_idx = _excel_col_to_index(price_col_letter)
+    max_idx = max(date_idx, id_idx, price_idx)
+
+    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    ws = wb[sheet_name]
+
+    dates, asset_ids, prices = [], [], []
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        if len(row) <= max_idx:
+            continue
+        d = row[date_idx]
+        if d is None:
+            continue
+        dates.append(d)
+        asset_ids.append(row[id_idx])
+        prices.append(row[price_idx])
+    wb.close()
+
+    df = pd.DataFrame({"date": dates, "asset_id": asset_ids, "price": prices})
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
     df = df[df["date"].notna()]
@@ -186,17 +210,33 @@ def preview_columns(file_bytes: bytes, filename: str, sheet_name: str, header_ro
     """
     Reads just the header + first 5 data rows for the 3 chosen columns, so
     you can visually confirm the letters point to the right data BEFORE
-    running the full computation on a large file.
+    running the full computation on a large file. Uses streaming read-only
+    mode and stops after 5 rows — never touches the rest of the file.
     """
+    import openpyxl
+
     tmp_path = CACHE_DIR / f"_raw_{filename}"
     if not tmp_path.exists():
         tmp_path.write_bytes(file_bytes)
-    usecols = f"{date_col_letter},{id_col_letter},{price_col_letter}"
-    df = pd.read_excel(
-        tmp_path, sheet_name=sheet_name, header=header_row - 1,
-        usecols=usecols, engine="openpyxl", nrows=5,
-    )
-    return df
+
+    date_idx = _excel_col_to_index(date_col_letter)
+    id_idx = _excel_col_to_index(id_col_letter)
+    price_idx = _excel_col_to_index(price_col_letter)
+    max_idx = max(date_idx, id_idx, price_idx)
+
+    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    ws = wb[sheet_name]
+
+    rows = []
+    for i, row in enumerate(ws.iter_rows(min_row=header_row + 1, values_only=True)):
+        if len(row) <= max_idx:
+            continue
+        rows.append((row[date_idx], row[id_idx], row[price_idx]))
+        if len(rows) >= 5:
+            break
+    wb.close()
+
+    return pd.DataFrame(rows, columns=["date", "asset_id (ISIN etc.)", "price"])
 
 
 def _excel_col_to_index(letter: str) -> int:
