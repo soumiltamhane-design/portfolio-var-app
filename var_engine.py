@@ -13,6 +13,15 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 
+# Above this many held assets, a full dense covariance matrix (N x N floats,
+# duplicated again inside the Monte Carlo Cholesky step) gets big enough to
+# exhaust memory on memory-constrained deployments (e.g. Streamlit Community
+# Cloud's free tier, ~1GB RAM). When that happens, the C-level BLAS/LAPACK
+# code can crash with a segmentation fault instead of Python raising a clean
+# MemoryError — so we guard against it explicitly rather than letting the
+# whole process die.
+MAX_ASSETS_FOR_FULL_COV = 1500
+
 
 # ---------------------------------------------------------------------------
 # Data prep
@@ -84,11 +93,17 @@ def parametric_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: f
     Returns the VaR result plus the covariance matrix and marginal VaR series
     (used later for component VaR).
     """
-    w = weights.reindex(returns.columns).fillna(0.0).values
-    cov_matrix = returns.cov()
+    _check_asset_count(returns.shape[1])
+
+    # float32 halves the memory footprint of the covariance matrix and every
+    # downstream matrix op — the single biggest lever for avoiding OOM-driven
+    # segfaults on large held-security universes. Precision loss is
+    # negligible for VaR purposes (well below basis-point level).
+    w = weights.reindex(returns.columns).fillna(0.0).values.astype(np.float32)
+    cov_matrix = returns.cov().astype(np.float32)
     portfolio_var_daily = w @ cov_matrix.values @ w.T
     portfolio_vol_daily = np.sqrt(max(portfolio_var_daily, 0))
-    portfolio_mean_daily = float(returns.mean().values @ w)
+    portfolio_mean_daily = float(returns.mean().values.astype(np.float32) @ w)
 
     z = _z_score(confidence)
     scale = np.sqrt(horizon_days)
@@ -143,13 +158,18 @@ def monte_carlo_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: 
     Monte Carlo using a Cholesky decomposition of the covariance matrix, so
     simulated shocks respect the actual correlation structure between assets.
     """
+    _check_asset_count(returns.shape[1])
+
     rng = np.random.default_rng(seed)
-    w = weights.reindex(returns.columns).fillna(0.0).values
-    mean = returns.mean().values
-    cov = returns.cov().values
+    # float32 throughout: the shocks matrix (n_sims x n_assets) is the
+    # single largest allocation in this whole app, and doubling it for
+    # float64 precision buys nothing meaningful for a VaR estimate.
+    w = weights.reindex(returns.columns).fillna(0.0).values.astype(np.float32)
+    mean = returns.mean().values.astype(np.float32)
+    cov = returns.cov().values.astype(np.float32)
 
     # jitter for numerical stability if the covariance matrix is near-singular
-    cov_stable = cov + np.eye(cov.shape[0]) * 1e-10
+    cov_stable = cov + np.eye(cov.shape[0], dtype=np.float32) * 1e-10
     try:
         L = np.linalg.cholesky(cov_stable)
     except np.linalg.LinAlgError:
@@ -157,12 +177,23 @@ def monte_carlo_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: 
         # very large number of highly correlated/collinear assets). Fall back
         # to ignoring cross-asset correlation rather than crashing — less
         # accurate, but still directionally useful and always completes.
-        L = np.diag(np.sqrt(np.clip(np.diag(cov_stable), 0, None)))
+        L = np.diag(np.sqrt(np.clip(np.diag(cov_stable), 0, None))).astype(np.float32)
 
-    shocks = rng.standard_normal(size=(n_sims, len(w)))
-    correlated_shocks = shocks @ L.T
-    simulated_asset_returns = mean + correlated_shocks
-    simulated_portfolio_returns = simulated_asset_returns @ w
+    # Run in batches rather than allocating one (n_sims x n_assets) array up
+    # front — for a large held-security universe that single allocation can
+    # be the tipping point that exhausts memory. Batching keeps peak memory
+    # bounded regardless of n_sims.
+    batch_size = max(1, min(n_sims, int(5_000_000 // max(len(w), 1))))
+    portfolio_return_batches = []
+    remaining = n_sims
+    while remaining > 0:
+        this_batch = min(batch_size, remaining)
+        shocks = rng.standard_normal(size=(this_batch, len(w))).astype(np.float32)
+        correlated_shocks = shocks @ L.T
+        simulated_asset_returns = mean + correlated_shocks
+        portfolio_return_batches.append(simulated_asset_returns @ w)
+        remaining -= this_batch
+    simulated_portfolio_returns = np.concatenate(portfolio_return_batches)
 
     if horizon_days > 1:
         simulated_portfolio_returns = simulated_portfolio_returns * np.sqrt(horizon_days)
@@ -250,6 +281,25 @@ def backtest_var(returns: pd.DataFrame, weights: pd.Series, var_pct: float) -> d
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _check_asset_count(n_assets: int) -> None:
+    """
+    Raises a normal, catchable Python exception (with a clear message) if
+    the held-asset universe is large enough that a dense N x N covariance
+    matrix risks exhausting memory and crashing the whole process with a
+    segfault instead. Callers (e.g. the Streamlit app) should catch this and
+    show it as a friendly on-screen error rather than letting the server die.
+    """
+    if n_assets > MAX_ASSETS_FOR_FULL_COV:
+        raise MemoryError(
+            f"{n_assets} assets is too many for a full covariance-based VaR "
+            f"calculation on this server's available memory (limit is "
+            f"{MAX_ASSETS_FOR_FULL_COV}). This is what was likely causing the "
+            f"deployed app to crash. Options: restrict to a subset of "
+            f"securities (e.g. only the largest positions), or run this "
+            f"locally / on a machine with more RAM, where this limit doesn't apply."
+        )
+
 
 def _z_score(confidence: float) -> float:
     # Standard normal inverse CDF for common confidence levels, avoids a scipy dependency
