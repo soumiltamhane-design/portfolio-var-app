@@ -45,6 +45,10 @@ def prices_to_returns(prices: pd.DataFrame, min_observations: int = 30) -> tuple
     returns = prices.pct_change().dropna(how="all")
     returns = returns.dropna(axis=1, how="all")
 
+    # any stray inf (e.g. a data glitch that slipped through as a genuine
+    # divide-by-zero) is treated the same as a missing observation
+    returns = returns.replace([np.inf, -np.inf], np.nan)
+
     # any remaining scattered gaps (e.g. an asset's first day, one-off missing
     # print) become 0 — a deliberate simplification once low-history assets
     # are already excluded, so covariance/matrix math never hits a NaN.
