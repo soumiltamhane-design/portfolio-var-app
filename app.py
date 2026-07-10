@@ -34,7 +34,7 @@ import streamlit as st
 from var_engine import (
     prices_to_returns, normalize_weights,
     parametric_var, historical_var, monte_carlo_var,
-    component_var, backtest_var,
+    component_var, backtest_var, individual_asset_var,
 )
 
 st.set_page_config(page_title="Instant Portfolio VaR", layout="wide")
@@ -219,6 +219,99 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
 
 
 @st.cache_data(show_spinner=False)
+def load_long_asof(file_bytes: bytes, filename: str, sheet_name: str,
+                    date_col_letter: str, id_col_letter: str, price_col_letter: str,
+                    header_row: int, as_of_date: "pd.Timestamp", lookback_years: int,
+                    fill_method: str = "ffill") -> tuple:
+    """
+    Like load_prices_long, but restricted to:
+      1. Only securities that have an actual row on exactly `as_of_date`
+         (i.e. still held on that date — matured/sold securities are excluded
+         entirely, even from the lookback window).
+      2. Only the `lookback_years` of history immediately before as_of_date
+         (out-of-window rows are skipped during streaming, not just filtered
+         afterward, to keep memory low on a large file).
+
+    Returns (wide_price_df, held_isins_count).
+    """
+    import openpyxl
+    import datetime as dt
+
+    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    if not tmp_path.exists():
+        tmp_path.write_bytes(file_bytes)
+
+    cache_key = (f"{filename}__asof_{sheet_name}_{date_col_letter}_{id_col_letter}_"
+                 f"{price_col_letter}_{as_of_date.date()}_{lookback_years}y_f{fill_method}")
+    cache_path = CACHE_DIR / f"{cache_key}.parquet"
+    meta_path = CACHE_DIR / f"{cache_key}.heldcount"
+    if cache_path.exists() and meta_path.exists():
+        return pd.read_parquet(cache_path), int(meta_path.read_text())
+
+    t0 = time.time()
+
+    date_idx = _excel_col_to_index(date_col_letter)
+    id_idx = _excel_col_to_index(id_col_letter)
+    price_idx = _excel_col_to_index(price_col_letter)
+    max_idx = max(date_idx, id_idx, price_idx)
+
+    as_of_norm = pd.Timestamp(as_of_date).normalize()
+    window_start = as_of_norm - pd.DateOffset(years=lookback_years)
+
+    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    ws = wb[sheet_name]
+
+    dates, asset_ids, prices = [], [], []
+    held_isins = set()
+
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+        if len(row) <= max_idx:
+            continue
+        d_raw = row[date_idx]
+        if d_raw is None:
+            continue
+        if isinstance(d_raw, (dt.datetime, dt.date)):
+            d = pd.Timestamp(d_raw).normalize()
+        else:
+            d = pd.to_datetime(d_raw, errors="coerce", dayfirst=True)
+            if pd.isna(d):
+                continue
+            d = d.normalize()
+
+        if d == as_of_norm:
+            held_isins.add(str(row[id_idx]).strip())
+
+        if window_start <= d <= as_of_norm:
+            dates.append(d)
+            asset_ids.append(str(row[id_idx]).strip())
+            prices.append(row[price_idx])
+    wb.close()
+
+    df = pd.DataFrame({"date": dates, "asset_id": asset_ids, "price": prices})
+    # keep only securities actually held on the as-of date
+    df = df[df["asset_id"].isin(held_isins)]
+
+    df["price"] = df["price"].replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df.loc[df["price"] <= 0, "price"] = np.nan
+    df = df.drop_duplicates(subset=["date", "asset_id"], keep="last")
+
+    wide = df.pivot(index="date", columns="asset_id", values="price")
+    wide = wide.sort_index()
+    wide = wide.dropna(axis=1, how="all")
+
+    if fill_method == "ffill":
+        wide = wide.ffill()
+    elif fill_method == "drop":
+        wide = wide.dropna(axis=0, how="any")
+
+    wide.to_parquet(cache_path)
+    meta_path.write_text(str(len(held_isins)))
+    st.session_state["_last_load_seconds"] = round(time.time() - t0, 1)
+    return wide, len(held_isins)
+
+
+@st.cache_data(show_spinner=False)
 def preview_columns(file_bytes: bytes, filename: str, sheet_name: str, header_row: int,
                      date_col_letter: str, id_col_letter: str, price_col_letter: str) -> pd.DataFrame:
     """
@@ -289,6 +382,7 @@ with st.sidebar:
     header_row, date_col_letter, fill_method, sheet_name = 1, "A", "none", None
     data_format = "wide"
     id_col_letter, price_col_letter = "C", "V"
+    asof_mode, as_of_date, lookback_years = False, None, 3
     if not use_demo:
         uploaded = st.file_uploader(
             "Upload price file",
@@ -336,6 +430,19 @@ with st.sidebar:
                 }[x],
                 index=1,
             )
+
+            asof_mode = st.checkbox(
+                "Restrict to securities currently held as of a specific date (recommended for 'current portfolio' analysis)",
+                value=False,
+            )
+            as_of_date, lookback_years = None, 3
+            if asof_mode:
+                as_of_date = st.date_input("As-of date", value=pd.Timestamp("2026-03-31"))
+                lookback_years = st.number_input("Years of history to use", min_value=1, max_value=10, value=3, step=1)
+                st.caption(
+                    "Only securities with an actual row on this exact date count as 'held' — "
+                    "matured/sold securities are excluded, even from the lookback window."
+                )
 
             if uploaded is not None and sheet_name:
                 try:
@@ -388,11 +495,20 @@ elif uploaded is not None:
         if not sheet_name:
             st.error("Could not determine the sheet name — please check the file.")
             st.stop()
-        prices = load_prices_long(
-            uploaded.getvalue(), uploaded.name, sheet_name,
-            date_col_letter, id_col_letter, price_col_letter,
-            header_row, fill_method,
-        )
+        if asof_mode and as_of_date:
+            prices, held_count = load_long_asof(
+                uploaded.getvalue(), uploaded.name, sheet_name,
+                date_col_letter, id_col_letter, price_col_letter,
+                header_row, pd.Timestamp(as_of_date), lookback_years, fill_method,
+            )
+            st.info(f"{held_count} securities were held on {pd.Timestamp(as_of_date).date()} and are included below "
+                    f"(using {lookback_years} year(s) of history).")
+        else:
+            prices = load_prices_long(
+                uploaded.getvalue(), uploaded.name, sheet_name,
+                date_col_letter, id_col_letter, price_col_letter,
+                header_row, fill_method,
+            )
     else:
         prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
     load_time = st.session_state.get("_last_load_seconds")
@@ -424,6 +540,33 @@ if dropped_assets:
 
 with st.expander("Preview returns matrix"):
     st.dataframe(returns.tail(10), use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Individual Security VaR (only shown in as-of-date mode)
+# ---------------------------------------------------------------------------
+
+if asof_mode:
+    st.subheader("2. Individual Security VaR — Top 5 riskiest holdings")
+    st.caption(
+        "Standalone VaR per security (its own volatility, no portfolio diversification "
+        "benefit factored in) — ranks currently-held securities by risk on their own."
+    )
+    ind_var = individual_asset_var(returns, confidence)
+    top5 = ind_var.head(5).copy()
+    top5.index.name = "Security ID"
+    st.dataframe(
+        top5.style.format({
+            "historical_var_pct": "{:.3%}",
+            "parametric_var_pct": "{:.3%}",
+        }),
+        use_container_width=True,
+    )
+    with st.expander(f"See all {len(ind_var)} held securities ranked"):
+        st.dataframe(
+            ind_var.style.format({"historical_var_pct": "{:.3%}", "parametric_var_pct": "{:.3%}"}),
+            use_container_width=True,
+        )
 
 
 # ---------------------------------------------------------------------------
