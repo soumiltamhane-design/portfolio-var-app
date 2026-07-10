@@ -10,6 +10,20 @@ native Excel formulas. Large .xlsx files are converted once to Parquet
 (cached on disk) so every subsequent run/recompute is instant.
 """
 
+import os
+# Must be set BEFORE numpy is imported. On memory-constrained cloud containers
+# (like Streamlit Community Cloud's free tier), numpy's underlying BLAS math
+# library can try to spin up multiple threads for matrix operations (covariance,
+# Cholesky decomposition) and crash with a segmentation fault instead of a
+# normal Python error. Forcing single-threaded BLAS avoids this entirely —
+# slightly slower per operation, but nowhere near enough to matter at this
+# problem size, and it won't crash.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 import time
 from pathlib import Path
 
@@ -358,7 +372,8 @@ with st.sidebar:
     confidence = st.select_slider("Confidence level", options=[0.90, 0.95, 0.975, 0.99], value=0.95)
     horizon_days = st.number_input("Horizon (days)", min_value=1, max_value=30, value=1)
     portfolio_value = st.number_input("Portfolio value (₹)", min_value=0.0, value=10_000_000.0, step=100000.0, format="%.0f")
-    n_sims = st.number_input("Monte Carlo simulations", min_value=1000, max_value=100000, value=20000, step=1000)
+    n_sims = st.number_input("Monte Carlo simulations", min_value=1000, max_value=100000, value=5000, step=1000)
+    st.caption("Lower this if you have a very large number of assets and hit memory errors on the deployed app.")
 
 
 # ---------------------------------------------------------------------------
