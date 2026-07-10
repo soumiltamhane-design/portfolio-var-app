@@ -208,6 +208,25 @@ def component_var(marginal_var: pd.Series, weights: pd.Series, portfolio_value: 
     return out.sort_values("component_var_amount", ascending=False)
 
 
+def individual_asset_var(returns: pd.DataFrame, confidence: float = 0.95) -> pd.DataFrame:
+    """
+    Standalone VaR per asset (no portfolio weighting, no cross-asset
+    correlation) — used to rank individual securities by their own risk,
+    e.g. "which of my currently-held bonds is riskiest on its own".
+    """
+    z = _z_score(confidence)
+    percentile = (1 - confidence) * 100
+
+    hist_var = returns.apply(lambda col: -np.nanpercentile(col.values, percentile))
+    param_var = -(returns.mean() - z * returns.std())
+
+    out = pd.DataFrame({
+        "historical_var_pct": hist_var.clip(lower=0),
+        "parametric_var_pct": param_var.clip(lower=0),
+    })
+    return out.sort_values("historical_var_pct", ascending=False)
+
+
 # ---------------------------------------------------------------------------
 # Backtesting
 # ---------------------------------------------------------------------------
