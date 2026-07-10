@@ -109,6 +109,9 @@ def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
     # "NA" text, blanks, dashes etc. all become proper missing values
     df = df.replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
     df = df.apply(pd.to_numeric, errors="coerce")
+    # a price of 0 (or negative) is always a data artifact, never a real bond/stock
+    # price — treat it as missing rather than a genuine 100% crash
+    df = df.mask(df <= 0)
 
     # drop columns that are entirely empty (no trades ever recorded)
     df = df.dropna(axis=1, how="all")
@@ -157,6 +160,8 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
     df["asset_id"] = df["asset_id"].astype(str).str.strip()
     df["price"] = df["price"].replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    # a price of 0 (or negative) is always a data artifact — treat as missing
+    df.loc[df["price"] <= 0, "price"] = np.nan
 
     # if a date+asset pair appears more than once, keep the last recorded value
     df = df.drop_duplicates(subset=["date", "asset_id"], keep="last")
@@ -173,6 +178,25 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
     wide.to_parquet(cache_path)
     st.session_state["_last_load_seconds"] = round(time.time() - t0, 1)
     return wide
+
+
+@st.cache_data(show_spinner=False)
+def preview_columns(file_bytes: bytes, filename: str, sheet_name: str, header_row: int,
+                     date_col_letter: str, id_col_letter: str, price_col_letter: str) -> pd.DataFrame:
+    """
+    Reads just the header + first 5 data rows for the 3 chosen columns, so
+    you can visually confirm the letters point to the right data BEFORE
+    running the full computation on a large file.
+    """
+    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    if not tmp_path.exists():
+        tmp_path.write_bytes(file_bytes)
+    usecols = f"{date_col_letter},{id_col_letter},{price_col_letter}"
+    df = pd.read_excel(
+        tmp_path, sheet_name=sheet_name, header=header_row - 1,
+        usecols=usecols, engine="openpyxl", nrows=5,
+    )
+    return df
 
 
 def _excel_col_to_index(letter: str) -> int:
@@ -258,6 +282,17 @@ with st.sidebar:
                 }[x],
                 index=1,
             )
+
+            if uploaded is not None and sheet_name:
+                try:
+                    preview_df = preview_columns(
+                        uploaded.getvalue(), uploaded.name, sheet_name, header_row,
+                        date_col_letter, id_col_letter, price_col_letter,
+                    )
+                    st.caption("Preview — check this looks right before computing:")
+                    st.dataframe(preview_df, hide_index=True, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Couldn't preview with these column letters: {e}")
         else:
             with st.expander("File layout settings (open this if your file has extra header rows, a different date column, or gaps like 'NA')"):
                 header_row = st.number_input(
