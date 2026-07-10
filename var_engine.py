@@ -18,12 +18,39 @@ from dataclasses import dataclass
 # Data prep
 # ---------------------------------------------------------------------------
 
-def prices_to_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """Convert a wide dates x assets price matrix into simple daily returns."""
-    returns = prices.sort_index().pct_change().dropna(how="all")
-    # Drop any asset column that's entirely NaN (bad ticker / no data)
+def prices_to_returns(prices: pd.DataFrame, min_observations: int = 30) -> tuple[pd.DataFrame, list]:
+    """
+    Convert a wide dates x assets price matrix into simple daily returns.
+
+    Real portfolios (especially bonds) have assets with wildly different
+    trading histories — some start in 2019, some in 2024, some mature early.
+    Matrix math (covariance, matrix multiplication) breaks completely the
+    moment even one cell is NaN, so this function:
+
+    1. Drops any asset with fewer than `min_observations` valid price points
+       (not enough history to estimate its risk contribution reliably).
+    2. Fills any remaining isolated gaps with 0 return for that day — this
+       only happens for scattered single-day gaps that survive upstream
+       forward-filling; it does NOT restore assets that were dropped in step 1.
+
+    Returns (returns_df, dropped_asset_names) so the caller can report what
+    was excluded and why.
+    """
+    prices = prices.sort_index()
+
+    valid_counts = prices.notna().sum()
+    dropped = list(valid_counts[valid_counts < min_observations].index)
+    prices = prices[[c for c in prices.columns if c not in dropped]]
+
+    returns = prices.pct_change().dropna(how="all")
     returns = returns.dropna(axis=1, how="all")
-    return returns
+
+    # any remaining scattered gaps (e.g. an asset's first day, one-off missing
+    # print) become 0 — a deliberate simplification once low-history assets
+    # are already excluded, so covariance/matrix math never hits a NaN.
+    returns = returns.fillna(0.0)
+
+    return returns, dropped
 
 
 def normalize_weights(weights: dict) -> pd.Series:
@@ -93,7 +120,7 @@ def historical_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: f
         portfolio_returns = portfolio_returns * np.sqrt(horizon_days)
 
     percentile = (1 - confidence) * 100
-    var_pct = -np.percentile(portfolio_returns, percentile)
+    var_pct = -np.nanpercentile(portfolio_returns, percentile)
     var_pct = max(var_pct, 0.0)
 
     return VaRResult(
