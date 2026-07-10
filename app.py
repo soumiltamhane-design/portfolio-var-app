@@ -1,232 +1,413 @@
 """
-Multi-Asset Portfolio VaR Engine
-----------------------------------
-Computes Value at Risk using three methods (Parametric, Historical, Monte Carlo)
-plus Component/Marginal VaR breakdown by position.
+Instant Multi-Asset VaR — drop a file, get VaR in seconds.
 
-Design goal: everything here operates on a returns matrix (dates x assets) and
-a weights vector, using vectorized numpy/pandas — no per-cell recalculation,
-so this runs in milliseconds even with hundreds of assets and years of daily data.
+Run locally:
+    pip install -r requirements.txt
+    streamlit run app.py
+
+Handles the exact problem this was built for: a huge Excel file that chokes
+native Excel formulas. Large .xlsx files are converted once to Parquet
+(cached on disk) so every subsequent run/recompute is instant.
 """
+
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+import streamlit as st
+
+from var_engine import (
+    prices_to_returns, normalize_weights,
+    parametric_var, historical_var, monte_carlo_var,
+    component_var, backtest_var,
+)
+
+st.set_page_config(page_title="Instant Portfolio VaR", layout="wide")
+
+CACHE_DIR = Path(".var_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Data prep
+# File loading with Parquet caching (this is what kills the 246MB problem)
 # ---------------------------------------------------------------------------
 
-def prices_to_returns(prices: pd.DataFrame, min_observations: int = 30) -> tuple[pd.DataFrame, list]:
+@st.cache_data(show_spinner=False)
+def list_sheet_names(file_bytes: bytes, filename: str) -> list[str]:
     """
-    Convert a wide dates x assets price matrix into simple daily returns.
-
-    Real portfolios (especially bonds) have assets with wildly different
-    trading histories — some start in 2019, some in 2024, some mature early.
-    Matrix math (covariance, matrix multiplication) breaks completely the
-    moment even one cell is NaN, so this function:
-
-    1. Drops any asset with fewer than `min_observations` valid price points
-       (not enough history to estimate its risk contribution reliably).
-    2. Fills any remaining isolated gaps with 0 return for that day — this
-       only happens for scattered single-day gaps that survive upstream
-       forward-filling; it does NOT restore assets that were dropped in step 1.
-
-    Returns (returns_df, dropped_asset_names) so the caller can report what
-    was excluded and why.
+    Peeks at an xlsx/xlsm file's sheet names without loading the full data —
+    fast even for large files, since it only reads workbook metadata.
     """
-    prices = prices.sort_index()
-
-    valid_counts = prices.notna().sum()
-    dropped = list(valid_counts[valid_counts < min_observations].index)
-    prices = prices[[c for c in prices.columns if c not in dropped]]
-
-    returns = prices.pct_change().dropna(how="all")
-    returns = returns.dropna(axis=1, how="all")
-
-    # any remaining scattered gaps (e.g. an asset's first day, one-off missing
-    # print) become 0 — a deliberate simplification once low-history assets
-    # are already excluded, so covariance/matrix math never hits a NaN.
-    returns = returns.fillna(0.0)
-
-    return returns, dropped
+    suffix = Path(filename).suffix.lower()
+    if suffix not in (".xlsx", ".xlsm"):
+        return []
+    tmp_path = CACHE_DIR / f"_peek_{filename}"
+    tmp_path.write_bytes(file_bytes)
+    import openpyxl
+    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    names = wb.sheetnames
+    wb.close()
+    return names
 
 
-def normalize_weights(weights: dict) -> pd.Series:
-    w = pd.Series(weights, dtype=float)
-    if w.sum() == 0:
-        raise ValueError("Weights sum to zero — check position sizes.")
-    return w / w.sum()
-
-
-# ---------------------------------------------------------------------------
-# Core VaR methods
-# ---------------------------------------------------------------------------
-
-@dataclass
-class VaRResult:
-    method: str
-    confidence: float
-    horizon_days: int
-    var_pct: float          # as a positive fraction, e.g. 0.023 = 2.3% loss
-    var_amount: float       # in portfolio currency units
-
-
-def parametric_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: float,
-                    confidence: float = 0.95, horizon_days: int = 1) -> tuple[VaRResult, pd.Series, pd.Series]:
+@st.cache_data(show_spinner=False)
+def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
+                 date_col_letter: str = "A", fill_method: str = "none",
+                 sheet_name: str = None) -> pd.DataFrame:
     """
-    Variance-covariance method. Assumes returns are approximately normal.
-    Returns the VaR result plus the covariance matrix and marginal VaR series
-    (used later for component VaR).
+    Loads a wide dates x assets price file.
+
+    header_row: the row number (1-indexed, as you'd see it in Excel) that
+        contains the asset codes/tickers. Everything above it is ignored.
+    date_col_letter: the Excel column letter that holds the dates (e.g. "A", "B").
+    fill_method: "none", "ffill" (carry last known price forward — the
+        correct choice for illiquid instruments like bonds that don't trade
+        every day), or "drop" (drop any row with missing values).
+    sheet_name: which worksheet to read (None = first sheet).
+
+    Caches a Parquet copy so re-runs (or re-computes with different weights)
+    skip the expensive Excel parse entirely.
     """
-    w = weights.reindex(returns.columns).fillna(0.0).values
-    cov_matrix = returns.cov()
-    portfolio_var_daily = w @ cov_matrix.values @ w.T
-    portfolio_vol_daily = np.sqrt(max(portfolio_var_daily, 0))
-    portfolio_mean_daily = float(returns.mean().values @ w)
+    suffix = Path(filename).suffix.lower()
+    cache_key = f"{filename}__s{sheet_name}_h{header_row}_c{date_col_letter}_f{fill_method}"
+    cache_path = CACHE_DIR / f"{cache_key}.parquet"
 
-    z = _z_score(confidence)
-    scale = np.sqrt(horizon_days)
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
 
-    var_pct = -(portfolio_mean_daily * horizon_days - z * portfolio_vol_daily * scale)
-    var_pct = max(var_pct, 0.0)
+    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    if not tmp_path.exists():
+        tmp_path.write_bytes(file_bytes)
 
-    result = VaRResult(
-        method="Parametric (Variance-Covariance)",
-        confidence=confidence,
-        horizon_days=horizon_days,
-        var_pct=var_pct,
-        var_amount=var_pct * portfolio_value,
-    )
-
-    marginal_var = (cov_matrix.values @ w) / portfolio_vol_daily if portfolio_vol_daily > 0 else np.zeros_like(w)
-    marginal_var = pd.Series(marginal_var, index=returns.columns)
-
-    return result, cov_matrix, marginal_var
-
-
-def historical_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: float,
-                    confidence: float = 0.95, horizon_days: int = 1) -> VaRResult:
-    """
-    Historical simulation. No distributional assumption — uses the actual
-    empirical distribution of portfolio returns. More robust to fat tails/skew.
-    """
-    w = weights.reindex(returns.columns).fillna(0.0).values
-    portfolio_returns = returns.values @ w  # collapse to single series
-
-    if horizon_days > 1:
-        # simple overlapping-window scaling; for real desks consider block bootstrap instead
-        portfolio_returns = portfolio_returns * np.sqrt(horizon_days)
-
-    percentile = (1 - confidence) * 100
-    var_pct = -np.nanpercentile(portfolio_returns, percentile)
-    var_pct = max(var_pct, 0.0)
-
-    return VaRResult(
-        method="Historical Simulation",
-        confidence=confidence,
-        horizon_days=horizon_days,
-        var_pct=var_pct,
-        var_amount=var_pct * portfolio_value,
-    )
-
-
-def monte_carlo_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: float,
-                     confidence: float = 0.95, horizon_days: int = 1,
-                     n_sims: int = 20000, seed: int = 42) -> VaRResult:
-    """
-    Monte Carlo using a Cholesky decomposition of the covariance matrix, so
-    simulated shocks respect the actual correlation structure between assets.
-    """
-    rng = np.random.default_rng(seed)
-    w = weights.reindex(returns.columns).fillna(0.0).values
-    mean = returns.mean().values
-    cov = returns.cov().values
-
-    # jitter for numerical stability if the covariance matrix is near-singular
-    cov_stable = cov + np.eye(cov.shape[0]) * 1e-12
-    L = np.linalg.cholesky(cov_stable)
-
-    shocks = rng.standard_normal(size=(n_sims, len(w)))
-    correlated_shocks = shocks @ L.T
-    simulated_asset_returns = mean + correlated_shocks
-    simulated_portfolio_returns = simulated_asset_returns @ w
-
-    if horizon_days > 1:
-        simulated_portfolio_returns = simulated_portfolio_returns * np.sqrt(horizon_days)
-
-    percentile = (1 - confidence) * 100
-    var_pct = -np.percentile(simulated_portfolio_returns, percentile)
-    var_pct = max(var_pct, 0.0)
-
-    return VaRResult(
-        method="Monte Carlo",
-        confidence=confidence,
-        horizon_days=horizon_days,
-        var_pct=var_pct,
-        var_amount=var_pct * portfolio_value,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Component / Marginal VaR
-# ---------------------------------------------------------------------------
-
-def component_var(marginal_var: pd.Series, weights: pd.Series, portfolio_value: float,
-                   parametric_var_pct: float, portfolio_vol_daily: float) -> pd.DataFrame:
-    """
-    Breaks total parametric VaR down by asset. Component VaRs sum to the
-    total portfolio VaR — shows which holdings are driving risk.
-    """
-    w = weights.reindex(marginal_var.index).fillna(0.0)
-    if portfolio_vol_daily == 0:
-        contrib_pct = pd.Series(0.0, index=marginal_var.index)
+    t0 = time.time()
+    if suffix in (".xlsx", ".xlsm"):
+        # header_row is 1-indexed in Excel; pandas' `header=` is 0-indexed
+        df = pd.read_excel(tmp_path, header=header_row - 1, engine="openpyxl",
+                            sheet_name=sheet_name if sheet_name else 0)
+    elif suffix == ".csv":
+        df = pd.read_csv(tmp_path, header=header_row - 1)
+    elif suffix == ".parquet":
+        df = pd.read_parquet(tmp_path)
     else:
-        contrib_pct = (w * marginal_var) / portfolio_vol_daily  # fraction of total vol
+        raise ValueError(f"Unsupported file type: {suffix}")
 
-    component_var_pct = contrib_pct * parametric_var_pct
-    component_var_amount = component_var_pct * portfolio_value
+    # Resolve the date column: pandas gives generic column names for the
+    # header row we picked, so find the one matching the chosen letter.
+    if suffix != ".parquet":
+        col_idx = _excel_col_to_index(date_col_letter)
+        date_col_name = df.columns[col_idx]
+        df = df.rename(columns={date_col_name: "__date__"}).set_index("__date__")
+        # drop any other columns to the left of the date column that were just headers/blank
+        df = df.drop(columns=[c for c in df.columns if str(c).startswith("Unnamed") and df[c].isna().all()])
 
-    out = pd.DataFrame({
-        "weight": w,
-        "component_var_pct": component_var_pct,
-        "component_var_amount": component_var_amount,
-    })
-    out["pct_of_total_var"] = out["component_var_amount"] / out["component_var_amount"].sum()
-    return out.sort_values("component_var_amount", ascending=False)
+    # dayfirst=True because Indian financial files use dd-mm-yyyy, not mm-dd-yyyy
+    df.index = pd.to_datetime(df.index, errors="coerce", dayfirst=True)
+    df = df[df.index.notna()]
+    df = df.sort_index()
+
+    # "NA" text, blanks, dashes etc. all become proper missing values
+    df = df.replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
+    df = df.apply(pd.to_numeric, errors="coerce")
+
+    # drop columns that are entirely empty (no trades ever recorded)
+    df = df.dropna(axis=1, how="all")
+
+    if fill_method == "ffill":
+        df = df.ffill()
+    elif fill_method == "drop":
+        df = df.dropna(axis=0, how="any")
+
+    df.to_parquet(cache_path)
+
+    st.session_state["_last_load_seconds"] = round(time.time() - t0, 1)
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Backtesting
-# ---------------------------------------------------------------------------
-
-def backtest_var(returns: pd.DataFrame, weights: pd.Series, var_pct: float) -> dict:
+@st.cache_data(show_spinner=False)
+def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
+                      date_col_letter: str, id_col_letter: str, price_col_letter: str,
+                      header_row: int = 1, fill_method: str = "none") -> pd.DataFrame:
     """
-    Counts how often actual portfolio losses exceeded the VaR estimate.
-    For a 95% VaR, expect ~5% of days to breach. Big deviations flag model risk.
+    Loads a 'long format' file: one row per (date, asset) pair, e.g. a daily
+    holdings/valuation report where each security reappears on every date it
+    was held. Pulls ONLY the three needed columns (by Excel letter) instead
+    of the whole sheet — much faster on a large file with many unused columns.
+    Pivots into the same wide dates x assets shape the rest of the app expects.
     """
-    w = weights.reindex(returns.columns).fillna(0.0).values
-    portfolio_returns = returns.values @ w
-    breaches = (portfolio_returns < -var_pct).sum()
-    total_days = len(portfolio_returns)
-    return {
-        "total_days": total_days,
-        "breaches": int(breaches),
-        "breach_rate": breaches / total_days if total_days else 0.0,
-    }
+    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    if not tmp_path.exists():
+        tmp_path.write_bytes(file_bytes)
+
+    cache_key = f"{filename}__long_{sheet_name}_{date_col_letter}_{id_col_letter}_{price_col_letter}_f{fill_method}"
+    cache_path = CACHE_DIR / f"{cache_key}.parquet"
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    t0 = time.time()
+    usecols = f"{date_col_letter},{id_col_letter},{price_col_letter}"
+    df = pd.read_excel(
+        tmp_path, sheet_name=sheet_name, header=header_row - 1,
+        usecols=usecols, engine="openpyxl",
+    )
+    df.columns = ["date", "asset_id", "price"]
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    df = df[df["date"].notna()]
+    df["asset_id"] = df["asset_id"].astype(str).str.strip()
+    df["price"] = df["price"].replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+    # if a date+asset pair appears more than once, keep the last recorded value
+    df = df.drop_duplicates(subset=["date", "asset_id"], keep="last")
+
+    wide = df.pivot(index="date", columns="asset_id", values="price")
+    wide = wide.sort_index()
+    wide = wide.dropna(axis=1, how="all")
+
+    if fill_method == "ffill":
+        wide = wide.ffill()
+    elif fill_method == "drop":
+        wide = wide.dropna(axis=0, how="any")
+
+    wide.to_parquet(cache_path)
+    st.session_state["_last_load_seconds"] = round(time.time() - t0, 1)
+    return wide
+
+
+def _excel_col_to_index(letter: str) -> int:
+    """Converts an Excel column letter ('A', 'B', ..., 'AA', ...) to a 0-indexed position."""
+    letter = letter.strip().upper()
+    idx = 0
+    for ch in letter:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def make_synthetic_demo(n_days=1000, n_assets=8, seed=7) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    tickers = [f"STOCK_{i+1}" for i in range(n_assets)]
+    market = rng.normal(0.0005, 0.01, n_days)
+    betas = rng.uniform(0.4, 1.6, n_assets)
+    idio = rng.normal(0, 0.015, (n_days, n_assets))
+    daily_returns = market[:, None] * betas[None, :] + idio
+    prices = 100 * np.cumprod(1 + daily_returns, axis=0)
+    return pd.DataFrame(prices, columns=tickers,
+                         index=pd.date_range("2022-01-01", periods=n_days, freq="B"))
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Sidebar — inputs
 # ---------------------------------------------------------------------------
 
-def _z_score(confidence: float) -> float:
-    # Standard normal inverse CDF for common confidence levels, avoids a scipy dependency
-    lookup = {0.90: 1.2816, 0.95: 1.6449, 0.975: 1.9600, 0.99: 2.3263, 0.995: 2.5758}
-    if confidence in lookup:
-        return lookup[confidence]
-    # fallback: linear nearest-neighbor interpolation isn't right for a CDF,
-    # so require scipy for anything non-standard
-    from scipy.stats import norm
-    return float(norm.ppf(confidence))
+st.title("📉 Instant Multi-Asset Portfolio VaR")
+st.caption("Drop a price file → get Parametric, Historical & Monte Carlo VaR in seconds — no Excel recalculation.")
+
+with st.sidebar:
+    st.header("1. Data")
+    use_demo = st.checkbox("Use synthetic demo data instead of uploading", value=True)
+
+    uploaded = None
+    header_row, date_col_letter, fill_method, sheet_name = 1, "A", "none", None
+    data_format = "wide"
+    id_col_letter, price_col_letter = "C", "V"
+    if not use_demo:
+        uploaded = st.file_uploader(
+            "Upload price file",
+            type=["xlsx", "xlsm", "csv", "parquet"],
+        )
+        st.caption(
+            "Large .xlsx/.xlsm files are cached to Parquet after the first load — "
+            "every recompute after that is instant."
+        )
+
+        sheet_name = None
+        if uploaded is not None and Path(uploaded.name).suffix.lower() in (".xlsx", ".xlsm"):
+            sheet_names = list_sheet_names(uploaded.getvalue(), uploaded.name)
+            if len(sheet_names) > 1:
+                sheet_name = st.selectbox(
+                    "Which worksheet has the actual price data?",
+                    options=sheet_names,
+                )
+            elif sheet_names:
+                sheet_name = sheet_names[0]
+
+        data_format = st.radio(
+            "How is your data laid out?",
+            options=["wide", "long"],
+            format_func=lambda x: {
+                "wide": "Wide — one row per date, one column per asset",
+                "long": "Long — one row per date+security (e.g. a holdings/valuation report)",
+            }[x],
+            index=0,
+        )
+
+        if data_format == "long":
+            st.caption("Only these 3 columns will be read — much faster on a large file.")
+            date_col_letter = st.text_input("Date column letter", value="A")
+            id_col_letter = st.text_input("Security ID column letter (e.g. ISIN)", value="C")
+            price_col_letter = st.text_input("Price column letter (e.g. Market Rate)", value="V")
+            header_row = st.number_input("Header row", min_value=1, value=1, step=1)
+            fill_method = st.selectbox(
+                "How to handle missing/'NA' values?",
+                options=["none", "ffill", "drop"],
+                format_func=lambda x: {
+                    "none": "Leave as missing (default)",
+                    "ffill": "Carry forward last known price — use this for bonds/illiquid assets that don't trade daily",
+                    "drop": "Drop any date with a missing value in any asset",
+                }[x],
+                index=1,
+            )
+        else:
+            with st.expander("File layout settings (open this if your file has extra header rows, a different date column, or gaps like 'NA')"):
+                header_row = st.number_input(
+                    "Which row has the asset names/codes (as seen in Excel)?",
+                    min_value=1, value=1, step=1,
+                )
+                date_col_letter = st.text_input(
+                    "Which column has the dates (Excel letter, e.g. A, B, C)?",
+                    value="A",
+                )
+                fill_method = st.selectbox(
+                    "How to handle missing/'NA' values?",
+                    options=["none", "ffill", "drop"],
+                    format_func=lambda x: {
+                        "none": "Leave as missing (default)",
+                        "ffill": "Carry forward last known price — use this for bonds/illiquid assets that don't trade daily",
+                        "drop": "Drop any date with a missing value in any asset",
+                    }[x],
+                    index=0,
+                )
+
+    st.header("2. VaR settings")
+    confidence = st.select_slider("Confidence level", options=[0.90, 0.95, 0.975, 0.99], value=0.95)
+    horizon_days = st.number_input("Horizon (days)", min_value=1, max_value=30, value=1)
+    portfolio_value = st.number_input("Portfolio value (₹)", min_value=0.0, value=10_000_000.0, step=100000.0, format="%.0f")
+    n_sims = st.number_input("Monte Carlo simulations", min_value=1000, max_value=100000, value=20000, step=1000)
+
+
+# ---------------------------------------------------------------------------
+# Load data
+# ---------------------------------------------------------------------------
+
+if use_demo:
+    prices = make_synthetic_demo()
+    st.info("Using synthetic demo data (8 correlated assets, 1000 trading days). Uncheck the box in the sidebar to upload your own file.")
+elif uploaded is not None:
+    if data_format == "long":
+        if not sheet_name:
+            st.error("Could not determine the sheet name — please check the file.")
+            st.stop()
+        prices = load_prices_long(
+            uploaded.getvalue(), uploaded.name, sheet_name,
+            date_col_letter, id_col_letter, price_col_letter,
+            header_row, fill_method,
+        )
+    else:
+        prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
+    load_time = st.session_state.get("_last_load_seconds")
+    if load_time:
+        st.success(f"Loaded and cached to Parquet in {load_time}s. Future recomputes on this file will be instant.")
+    if prices.shape[1] == 0:
+        st.error("No asset columns were found. Double-check the column letter / header row settings above.")
+        st.stop()
+else:
+    st.warning("Upload a file or check 'use synthetic demo data' to continue.")
+    st.stop()
+
+returns, dropped_assets = prices_to_returns(prices)
+tickers = list(returns.columns)
+
+st.subheader("Loaded data")
+c1, c2, c3 = st.columns(3)
+c1.metric("Assets", len(tickers))
+c2.metric("Trading days", len(returns))
+c3.metric("Date range", f"{returns.index.min().date()} → {returns.index.max().date()}")
+
+if dropped_assets:
+    st.warning(
+        f"{len(dropped_assets)} asset(s) were excluded — not enough price history "
+        f"(need at least 30 valid price points) to reliably estimate risk. "
+        f"Excluded: {', '.join(dropped_assets[:15])}"
+        + (f", and {len(dropped_assets)-15} more" if len(dropped_assets) > 15 else "")
+    )
+
+with st.expander("Preview returns matrix"):
+    st.dataframe(returns.tail(10), use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Weights
+# ---------------------------------------------------------------------------
+
+st.subheader("3. Portfolio weights")
+weight_mode = st.radio("Set weights", ["Equal weight", "Manual entry"], horizontal=True)
+
+if weight_mode == "Equal weight":
+    raw_weights = {t: 1.0 for t in tickers}
+else:
+    default_df = pd.DataFrame({"ticker": tickers, "weight": [1.0] * len(tickers)})
+    edited = st.data_editor(default_df, hide_index=True, use_container_width=True, key="weights_editor")
+    raw_weights = dict(zip(edited["ticker"], edited["weight"]))
+
+weights = normalize_weights(raw_weights)
+
+if not st.button("🚀 Compute VaR", type="primary"):
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Compute — this whole block should run in well under a second
+# ---------------------------------------------------------------------------
+
+t0 = time.time()
+
+p_res, cov_matrix, marginal_var = parametric_var(returns, weights, portfolio_value, confidence, horizon_days)
+h_res = historical_var(returns, weights, portfolio_value, confidence, horizon_days)
+mc_res = monte_carlo_var(returns, weights, portfolio_value, confidence, horizon_days, n_sims=n_sims)
+
+w_aligned = weights.reindex(returns.columns).fillna(0.0)
+port_vol_daily = float(np.sqrt(w_aligned.values @ cov_matrix.values @ w_aligned.values.T))
+comp = component_var(marginal_var, weights, portfolio_value, p_res.var_pct, port_vol_daily)
+
+bt = backtest_var(returns, weights, p_res.var_pct)
+
+compute_time = time.time() - t0
+
+st.success(f"Computed all three VaR methods + component breakdown + backtest in {compute_time:.3f} seconds.")
+
+st.subheader(f"4. Results — {int(confidence*100)}% confidence, {horizon_days}-day horizon")
+
+col1, col2, col3 = st.columns(3)
+for col, res in zip([col1, col2, col3], [p_res, h_res, mc_res]):
+    col.metric(res.method, f"{res.var_pct*100:.2f}%", f"₹ {res.var_amount:,.0f}")
+
+st.caption(
+    "If the three methods diverge a lot, your return distribution likely has fat tails "
+    "or skew that the parametric (normal-distribution) method underestimates — trust "
+    "Historical/Monte Carlo more in that case."
+)
+
+st.subheader("5. Component VaR — which holdings drive the risk")
+st.dataframe(
+    comp.style.format({
+        "weight": "{:.2%}",
+        "component_var_pct": "{:.3%}",
+        "component_var_amount": "₹ {:,.0f}",
+        "pct_of_total_var": "{:.1%}",
+    }),
+    use_container_width=True,
+)
+st.bar_chart(comp["component_var_amount"])
+
+st.subheader("6. Backtest — did actual losses exceed VaR as often as expected?")
+expected_breach_rate = 1 - confidence
+bcol1, bcol2, bcol3 = st.columns(3)
+bcol1.metric("Trading days tested", bt["total_days"])
+bcol2.metric("Breaches", bt["breaches"])
+bcol3.metric("Actual breach rate", f"{bt['breach_rate']*100:.2f}%", f"expected ≈ {expected_breach_rate*100:.1f}%")
+
+if bt["breach_rate"] > expected_breach_rate * 1.5:
+    st.warning("Breach rate is notably higher than expected — the VaR model may be understating risk.")
+elif bt["breach_rate"] < expected_breach_rate * 0.5:
+    st.info("Breach rate is notably lower than expected — the VaR model may be overly conservative.")
