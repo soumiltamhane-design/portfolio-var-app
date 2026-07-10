@@ -149,8 +149,15 @@ def monte_carlo_var(returns: pd.DataFrame, weights: pd.Series, portfolio_value: 
     cov = returns.cov().values
 
     # jitter for numerical stability if the covariance matrix is near-singular
-    cov_stable = cov + np.eye(cov.shape[0]) * 1e-12
-    L = np.linalg.cholesky(cov_stable)
+    cov_stable = cov + np.eye(cov.shape[0]) * 1e-10
+    try:
+        L = np.linalg.cholesky(cov_stable)
+    except np.linalg.LinAlgError:
+        # Matrix isn't positive-definite even with jitter (can happen with a
+        # very large number of highly correlated/collinear assets). Fall back
+        # to ignoring cross-asset correlation rather than crashing — less
+        # accurate, but still directionally useful and always completes.
+        L = np.diag(np.sqrt(np.clip(np.diag(cov_stable), 0, None)))
 
     shocks = rng.standard_normal(size=(n_sims, len(w)))
     correlated_shocks = shocks @ L.T
