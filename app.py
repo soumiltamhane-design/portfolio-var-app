@@ -34,8 +34,27 @@ CACHE_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
+def list_sheet_names(file_bytes: bytes, filename: str) -> list[str]:
+    """
+    Peeks at an xlsx/xlsm file's sheet names without loading the full data —
+    fast even for large files, since it only reads workbook metadata.
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix not in (".xlsx", ".xlsm"):
+        return []
+    tmp_path = CACHE_DIR / f"_peek_{filename}"
+    tmp_path.write_bytes(file_bytes)
+    import openpyxl
+    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    names = wb.sheetnames
+    wb.close()
+    return names
+
+
+@st.cache_data(show_spinner=False)
 def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
-                 date_col_letter: str = "A", fill_method: str = "none") -> pd.DataFrame:
+                 date_col_letter: str = "A", fill_method: str = "none",
+                 sheet_name: str = None) -> pd.DataFrame:
     """
     Loads a wide dates x assets price file.
 
@@ -45,12 +64,13 @@ def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
     fill_method: "none", "ffill" (carry last known price forward — the
         correct choice for illiquid instruments like bonds that don't trade
         every day), or "drop" (drop any row with missing values).
+    sheet_name: which worksheet to read (None = first sheet).
 
     Caches a Parquet copy so re-runs (or re-computes with different weights)
     skip the expensive Excel parse entirely.
     """
     suffix = Path(filename).suffix.lower()
-    cache_key = f"{filename}__h{header_row}_c{date_col_letter}_f{fill_method}"
+    cache_key = f"{filename}__s{sheet_name}_h{header_row}_c{date_col_letter}_f{fill_method}"
     cache_path = CACHE_DIR / f"{cache_key}.parquet"
 
     if cache_path.exists():
@@ -63,7 +83,8 @@ def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
     t0 = time.time()
     if suffix in (".xlsx", ".xlsm"):
         # header_row is 1-indexed in Excel; pandas' `header=` is 0-indexed
-        df = pd.read_excel(tmp_path, header=header_row - 1, engine="openpyxl")
+        df = pd.read_excel(tmp_path, header=header_row - 1, engine="openpyxl",
+                            sheet_name=sheet_name if sheet_name else 0)
     elif suffix == ".csv":
         df = pd.read_csv(tmp_path, header=header_row - 1)
     elif suffix == ".parquet":
@@ -136,7 +157,7 @@ with st.sidebar:
     use_demo = st.checkbox("Use synthetic demo data instead of uploading", value=True)
 
     uploaded = None
-    header_row, date_col_letter, fill_method = 1, "A", "none"
+    header_row, date_col_letter, fill_method, sheet_name = 1, "A", "none", None
     if not use_demo:
         uploaded = st.file_uploader(
             "Upload price file (dates x assets, wide format)",
@@ -146,6 +167,17 @@ with st.sidebar:
             "Large .xlsx/.xlsm files are cached to Parquet after the first load — "
             "every recompute after that is instant."
         )
+
+        sheet_name = None
+        if uploaded is not None and Path(uploaded.name).suffix.lower() in (".xlsx", ".xlsm"):
+            sheet_names = list_sheet_names(uploaded.getvalue(), uploaded.name)
+            if len(sheet_names) > 1:
+                sheet_name = st.selectbox(
+                    "Which worksheet has the actual price data?",
+                    options=sheet_names,
+                )
+            elif sheet_names:
+                sheet_name = sheet_names[0]
 
         with st.expander("File layout settings (open this if your file has extra header rows, a different date column, or gaps like 'NA')"):
             header_row = st.number_input(
@@ -182,7 +214,7 @@ if use_demo:
     prices = make_synthetic_demo()
     st.info("Using synthetic demo data (8 correlated assets, 1000 trading days). Uncheck the box in the sidebar to upload your own file.")
 elif uploaded is not None:
-    prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method)
+    prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
     load_time = st.session_state.get("_last_load_seconds")
     if load_time:
         st.success(f"Loaded and cached to Parquet in {load_time}s. Future recomputes on this file will be instant.")
