@@ -124,6 +124,57 @@ def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
+                      date_col_letter: str, id_col_letter: str, price_col_letter: str,
+                      header_row: int = 1, fill_method: str = "none") -> pd.DataFrame:
+    """
+    Loads a 'long format' file: one row per (date, asset) pair, e.g. a daily
+    holdings/valuation report where each security reappears on every date it
+    was held. Pulls ONLY the three needed columns (by Excel letter) instead
+    of the whole sheet — much faster on a large file with many unused columns.
+    Pivots into the same wide dates x assets shape the rest of the app expects.
+    """
+    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    if not tmp_path.exists():
+        tmp_path.write_bytes(file_bytes)
+
+    cache_key = f"{filename}__long_{sheet_name}_{date_col_letter}_{id_col_letter}_{price_col_letter}_f{fill_method}"
+    cache_path = CACHE_DIR / f"{cache_key}.parquet"
+    if cache_path.exists():
+        return pd.read_parquet(cache_path)
+
+    t0 = time.time()
+    usecols = f"{date_col_letter},{id_col_letter},{price_col_letter}"
+    df = pd.read_excel(
+        tmp_path, sheet_name=sheet_name, header=header_row - 1,
+        usecols=usecols, engine="openpyxl",
+    )
+    df.columns = ["date", "asset_id", "price"]
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    df = df[df["date"].notna()]
+    df["asset_id"] = df["asset_id"].astype(str).str.strip()
+    df["price"] = df["price"].replace(["NA", "N/A", "-", "", "#N/A"], np.nan)
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+
+    # if a date+asset pair appears more than once, keep the last recorded value
+    df = df.drop_duplicates(subset=["date", "asset_id"], keep="last")
+
+    wide = df.pivot(index="date", columns="asset_id", values="price")
+    wide = wide.sort_index()
+    wide = wide.dropna(axis=1, how="all")
+
+    if fill_method == "ffill":
+        wide = wide.ffill()
+    elif fill_method == "drop":
+        wide = wide.dropna(axis=0, how="any")
+
+    wide.to_parquet(cache_path)
+    st.session_state["_last_load_seconds"] = round(time.time() - t0, 1)
+    return wide
+
+
 def _excel_col_to_index(letter: str) -> int:
     """Converts an Excel column letter ('A', 'B', ..., 'AA', ...) to a 0-indexed position."""
     letter = letter.strip().upper()
@@ -158,9 +209,11 @@ with st.sidebar:
 
     uploaded = None
     header_row, date_col_letter, fill_method, sheet_name = 1, "A", "none", None
+    data_format = "wide"
+    id_col_letter, price_col_letter = "C", "V"
     if not use_demo:
         uploaded = st.file_uploader(
-            "Upload price file (dates x assets, wide format)",
+            "Upload price file",
             type=["xlsx", "xlsm", "csv", "parquet"],
         )
         st.caption(
@@ -179,15 +232,22 @@ with st.sidebar:
             elif sheet_names:
                 sheet_name = sheet_names[0]
 
-        with st.expander("File layout settings (open this if your file has extra header rows, a different date column, or gaps like 'NA')"):
-            header_row = st.number_input(
-                "Which row has the asset names/codes (as seen in Excel)?",
-                min_value=1, value=1, step=1,
-            )
-            date_col_letter = st.text_input(
-                "Which column has the dates (Excel letter, e.g. A, B, C)?",
-                value="A",
-            )
+        data_format = st.radio(
+            "How is your data laid out?",
+            options=["wide", "long"],
+            format_func=lambda x: {
+                "wide": "Wide — one row per date, one column per asset",
+                "long": "Long — one row per date+security (e.g. a holdings/valuation report)",
+            }[x],
+            index=0,
+        )
+
+        if data_format == "long":
+            st.caption("Only these 3 columns will be read — much faster on a large file.")
+            date_col_letter = st.text_input("Date column letter", value="A")
+            id_col_letter = st.text_input("Security ID column letter (e.g. ISIN)", value="C")
+            price_col_letter = st.text_input("Price column letter (e.g. Market Rate)", value="V")
+            header_row = st.number_input("Header row", min_value=1, value=1, step=1)
             fill_method = st.selectbox(
                 "How to handle missing/'NA' values?",
                 options=["none", "ffill", "drop"],
@@ -196,8 +256,28 @@ with st.sidebar:
                     "ffill": "Carry forward last known price — use this for bonds/illiquid assets that don't trade daily",
                     "drop": "Drop any date with a missing value in any asset",
                 }[x],
-                index=0,
+                index=1,
             )
+        else:
+            with st.expander("File layout settings (open this if your file has extra header rows, a different date column, or gaps like 'NA')"):
+                header_row = st.number_input(
+                    "Which row has the asset names/codes (as seen in Excel)?",
+                    min_value=1, value=1, step=1,
+                )
+                date_col_letter = st.text_input(
+                    "Which column has the dates (Excel letter, e.g. A, B, C)?",
+                    value="A",
+                )
+                fill_method = st.selectbox(
+                    "How to handle missing/'NA' values?",
+                    options=["none", "ffill", "drop"],
+                    format_func=lambda x: {
+                        "none": "Leave as missing (default)",
+                        "ffill": "Carry forward last known price — use this for bonds/illiquid assets that don't trade daily",
+                        "drop": "Drop any date with a missing value in any asset",
+                    }[x],
+                    index=0,
+                )
 
     st.header("2. VaR settings")
     confidence = st.select_slider("Confidence level", options=[0.90, 0.95, 0.975, 0.99], value=0.95)
@@ -214,12 +294,22 @@ if use_demo:
     prices = make_synthetic_demo()
     st.info("Using synthetic demo data (8 correlated assets, 1000 trading days). Uncheck the box in the sidebar to upload your own file.")
 elif uploaded is not None:
-    prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
+    if data_format == "long":
+        if not sheet_name:
+            st.error("Could not determine the sheet name — please check the file.")
+            st.stop()
+        prices = load_prices_long(
+            uploaded.getvalue(), uploaded.name, sheet_name,
+            date_col_letter, id_col_letter, price_col_letter,
+            header_row, fill_method,
+        )
+    else:
+        prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
     load_time = st.session_state.get("_last_load_seconds")
     if load_time:
         st.success(f"Loaded and cached to Parquet in {load_time}s. Future recomputes on this file will be instant.")
     if prices.shape[1] == 0:
-        st.error("No asset columns were found. Double-check the header row and date column settings above.")
+        st.error("No asset columns were found. Double-check the column letter / header row settings above.")
         st.stop()
 else:
     st.warning("Upload a file or check 'use synthetic demo data' to continue.")
