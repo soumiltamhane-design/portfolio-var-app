@@ -35,6 +35,7 @@ from var_engine import (
     prices_to_returns, normalize_weights,
     parametric_var, historical_var, monte_carlo_var,
     component_var, backtest_var, individual_asset_var,
+    MAX_ASSETS_FOR_FULL_COV,
 )
 
 st.set_page_config(page_title="Instant Portfolio VaR", layout="wide")
@@ -451,7 +452,7 @@ with st.sidebar:
                         date_col_letter, id_col_letter, price_col_letter,
                     )
                     st.caption("Preview — check this looks right before computing:")
-                    st.dataframe(preview_df, hide_index=True, use_container_width=True)
+                    st.dataframe(preview_df, hide_index=True, width='stretch')
                 except Exception as e:
                     st.error(f"Couldn't preview with these column letters: {e}")
         else:
@@ -530,6 +531,15 @@ c1.metric("Assets", len(tickers))
 c2.metric("Trading days", len(returns))
 c3.metric("Date range", f"{returns.index.min().date()} → {returns.index.max().date()}")
 
+if len(tickers) > MAX_ASSETS_FOR_FULL_COV:
+    st.error(
+        f"{len(tickers)} securities are loaded, which is more than this server's "
+        f"memory can safely handle for portfolio VaR ({MAX_ASSETS_FOR_FULL_COV} max) — "
+        f"clicking Compute would likely crash the app. Restrict to a smaller set of "
+        f"securities (e.g. top positions by size) or run this app locally/on a "
+        f"larger machine, where this limit doesn't apply."
+    )
+
 if dropped_assets:
     st.warning(
         f"{len(dropped_assets)} asset(s) were excluded — not enough price history "
@@ -539,7 +549,7 @@ if dropped_assets:
     )
 
 with st.expander("Preview returns matrix"):
-    st.dataframe(returns.tail(10), use_container_width=True)
+    st.dataframe(returns.tail(10), width='stretch')
 
 
 # ---------------------------------------------------------------------------
@@ -560,12 +570,12 @@ if asof_mode:
             "historical_var_pct": "{:.3%}",
             "parametric_var_pct": "{:.3%}",
         }),
-        use_container_width=True,
+        width='stretch',
     )
     with st.expander(f"See all {len(ind_var)} held securities ranked"):
         st.dataframe(
             ind_var.style.format({"historical_var_pct": "{:.3%}", "parametric_var_pct": "{:.3%}"}),
-            use_container_width=True,
+            width='stretch',
         )
 
 
@@ -580,7 +590,7 @@ if weight_mode == "Equal weight":
     raw_weights = {t: 1.0 for t in tickers}
 else:
     default_df = pd.DataFrame({"ticker": tickers, "weight": [1.0] * len(tickers)})
-    edited = st.data_editor(default_df, hide_index=True, use_container_width=True, key="weights_editor")
+    edited = st.data_editor(default_df, hide_index=True, width='stretch', key="weights_editor")
     raw_weights = dict(zip(edited["ticker"], edited["weight"]))
 
 weights = normalize_weights(raw_weights)
@@ -595,15 +605,24 @@ if not st.button("🚀 Compute VaR", type="primary"):
 
 t0 = time.time()
 
-p_res, cov_matrix, marginal_var = parametric_var(returns, weights, portfolio_value, confidence, horizon_days)
-h_res = historical_var(returns, weights, portfolio_value, confidence, horizon_days)
-mc_res = monte_carlo_var(returns, weights, portfolio_value, confidence, horizon_days, n_sims=n_sims)
+try:
+    p_res, cov_matrix, marginal_var = parametric_var(returns, weights, portfolio_value, confidence, horizon_days)
+    h_res = historical_var(returns, weights, portfolio_value, confidence, horizon_days)
+    mc_res = monte_carlo_var(returns, weights, portfolio_value, confidence, horizon_days, n_sims=n_sims)
 
-w_aligned = weights.reindex(returns.columns).fillna(0.0)
-port_vol_daily = float(np.sqrt(w_aligned.values @ cov_matrix.values @ w_aligned.values.T))
-comp = component_var(marginal_var, weights, portfolio_value, p_res.var_pct, port_vol_daily)
+    w_aligned = weights.reindex(returns.columns).fillna(0.0).astype(np.float32)
+    port_vol_daily = float(np.sqrt(w_aligned.values @ cov_matrix.values @ w_aligned.values.T))
+    comp = component_var(marginal_var, weights, portfolio_value, p_res.var_pct, port_vol_daily)
 
-bt = backtest_var(returns, weights, p_res.var_pct)
+    bt = backtest_var(returns, weights, p_res.var_pct)
+except MemoryError as e:
+    # This is exactly the failure mode that used to crash the whole server
+    # with an unrecoverable segmentation fault (too many held assets for a
+    # dense covariance matrix to fit in memory). var_engine now raises this
+    # as a normal exception *before* attempting the dangerous allocation, so
+    # we can show a clear on-screen message instead of the app dying.
+    st.error(str(e))
+    st.stop()
 
 compute_time = time.time() - t0
 
@@ -629,7 +648,7 @@ st.dataframe(
         "component_var_amount": "₹ {:,.0f}",
         "pct_of_total_var": "{:.1%}",
     }),
-    use_container_width=True,
+    width='stretch',
 )
 st.bar_chart(comp["component_var_amount"])
 
