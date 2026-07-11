@@ -61,6 +61,45 @@ def _content_key(file_bytes: bytes, filename: str) -> str:
 # File loading with Parquet caching (this is what kills the 246MB problem)
 # ---------------------------------------------------------------------------
 
+def _write_and_validate(tmp_path: Path, file_bytes: bytes) -> None:
+    """
+    Writes the uploaded bytes to disk and verifies the file landed intact.
+    Large uploads (hundreds of MB) over a slow or unstable connection can
+    arrive truncated/corrupted — writing a partial file and then trying to
+    open it as an xlsx produces a confusing low-level zip-archive error.
+    This catches that case early with a clear, actionable message instead.
+    """
+    tmp_path.write_bytes(file_bytes)
+    written_size = tmp_path.stat().st_size
+    if written_size != len(file_bytes):
+        tmp_path.unlink(missing_ok=True)
+        raise IOError(
+            f"The uploaded file didn't save completely ({written_size:,} of "
+            f"{len(file_bytes):,} bytes written) — this usually means the "
+            f"upload was interrupted, which can happen with very large files "
+            f"on a slow or unstable connection. Please try uploading again."
+        )
+
+
+def _friendly_excel_open(tmp_path: Path):
+    """
+    Opens a workbook with openpyxl, converting the low-level zip/archive
+    error into a message that actually tells you what to do next.
+    """
+    import openpyxl
+    from openpyxl.utils.exceptions import InvalidFileException
+    try:
+        return openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    except InvalidFileException:
+        tmp_path.unlink(missing_ok=True)  # force a clean re-upload next time, not a corrupt cached copy
+        raise IOError(
+            "This file couldn't be opened as a valid Excel file. Since it opens fine in Excel "
+            "itself, this almost always means the upload to the app didn't complete properly "
+            "(common with very large files). Please try uploading it again — if it keeps "
+            "failing, try on a more stable internet connection."
+        )
+
+
 @st.cache_data(show_spinner=False)
 def list_sheet_names(file_bytes: bytes, filename: str) -> list[str]:
     """
@@ -71,9 +110,8 @@ def list_sheet_names(file_bytes: bytes, filename: str) -> list[str]:
     if suffix not in (".xlsx", ".xlsm"):
         return []
     tmp_path = CACHE_DIR / f"_peek_{_content_key(file_bytes, filename)}"
-    tmp_path.write_bytes(file_bytes)
-    import openpyxl
-    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    _write_and_validate(tmp_path, file_bytes)
+    wb = _friendly_excel_open(tmp_path)
     names = wb.sheetnames
     wb.close()
     return names
@@ -107,7 +145,7 @@ def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
 
     tmp_path = CACHE_DIR / f"_raw_{content_key}{suffix}"
     if not tmp_path.exists():
-        tmp_path.write_bytes(file_bytes)
+        _write_and_validate(tmp_path, file_bytes)
 
     t0 = time.time()
     if suffix in (".xlsx", ".xlsm"):
@@ -178,7 +216,7 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
     content_key = _content_key(file_bytes, filename)
     tmp_path = CACHE_DIR / f"_raw_{content_key}{Path(filename).suffix.lower()}"
     if not tmp_path.exists():
-        tmp_path.write_bytes(file_bytes)
+        _write_and_validate(tmp_path, file_bytes)
 
     cache_key = f"{content_key}__long_{sheet_name}_{date_col_letter}_{id_col_letter}_{price_col_letter}_f{fill_method}"
     cache_path = CACHE_DIR / f"{cache_key}.parquet"
@@ -192,7 +230,7 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
     price_idx = _excel_col_to_index(price_col_letter)
     max_idx = max(date_idx, id_idx, price_idx)
 
-    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    wb = _friendly_excel_open(tmp_path)
     ws = wb[sheet_name]
 
     dates, asset_ids, prices = [], [], []
@@ -256,7 +294,7 @@ def load_long_asof(file_bytes: bytes, filename: str, sheet_name: str,
     content_key = _content_key(file_bytes, filename)
     tmp_path = CACHE_DIR / f"_raw_{content_key}{Path(filename).suffix.lower()}"
     if not tmp_path.exists():
-        tmp_path.write_bytes(file_bytes)
+        _write_and_validate(tmp_path, file_bytes)
 
     cache_key = (f"{content_key}__asof_{sheet_name}_{date_col_letter}_{id_col_letter}_"
                  f"{price_col_letter}_{as_of_date.date()}_{lookback_years}y_f{fill_method}")
@@ -275,7 +313,7 @@ def load_long_asof(file_bytes: bytes, filename: str, sheet_name: str,
     as_of_norm = pd.Timestamp(as_of_date).normalize()
     window_start = as_of_norm - pd.DateOffset(years=lookback_years)
 
-    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    wb = _friendly_excel_open(tmp_path)
     ws = wb[sheet_name]
 
     dates, asset_ids, prices = [], [], []
@@ -342,14 +380,14 @@ def preview_columns(file_bytes: bytes, filename: str, sheet_name: str, header_ro
     content_key = _content_key(file_bytes, filename)
     tmp_path = CACHE_DIR / f"_raw_{content_key}{Path(filename).suffix.lower()}"
     if not tmp_path.exists():
-        tmp_path.write_bytes(file_bytes)
+        _write_and_validate(tmp_path, file_bytes)
 
     date_idx = _excel_col_to_index(date_col_letter)
     id_idx = _excel_col_to_index(id_col_letter)
     price_idx = _excel_col_to_index(price_col_letter)
     max_idx = max(date_idx, id_idx, price_idx)
 
-    wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
+    wb = _friendly_excel_open(tmp_path)
     ws = wb[sheet_name]
 
     rows = []
@@ -413,7 +451,11 @@ with st.sidebar:
 
         sheet_name = None
         if uploaded is not None and Path(uploaded.name).suffix.lower() in (".xlsx", ".xlsm"):
-            sheet_names = list_sheet_names(uploaded.getvalue(), uploaded.name)
+            try:
+                sheet_names = list_sheet_names(uploaded.getvalue(), uploaded.name)
+            except IOError as e:
+                st.error(str(e))
+                st.stop()
             if len(sheet_names) > 1:
                 sheet_name = st.selectbox(
                     "Which worksheet has the actual price data?",
@@ -513,22 +555,30 @@ elif uploaded is not None:
         if not sheet_name:
             st.error("Could not determine the sheet name — please check the file.")
             st.stop()
-        if asof_mode and as_of_date:
-            prices, held_count = load_long_asof(
-                uploaded.getvalue(), uploaded.name, sheet_name,
-                date_col_letter, id_col_letter, price_col_letter,
-                header_row, pd.Timestamp(as_of_date), lookback_years, fill_method,
-            )
-            st.info(f"{held_count} securities were held on {pd.Timestamp(as_of_date).date()} and are included below "
-                    f"(using {lookback_years} year(s) of history).")
-        else:
-            prices = load_prices_long(
-                uploaded.getvalue(), uploaded.name, sheet_name,
-                date_col_letter, id_col_letter, price_col_letter,
-                header_row, fill_method,
-            )
+        try:
+            if asof_mode and as_of_date:
+                prices, held_count = load_long_asof(
+                    uploaded.getvalue(), uploaded.name, sheet_name,
+                    date_col_letter, id_col_letter, price_col_letter,
+                    header_row, pd.Timestamp(as_of_date), lookback_years, fill_method,
+                )
+                st.info(f"{held_count} securities were held on {pd.Timestamp(as_of_date).date()} and are included below "
+                        f"(using {lookback_years} year(s) of history).")
+            else:
+                prices = load_prices_long(
+                    uploaded.getvalue(), uploaded.name, sheet_name,
+                    date_col_letter, id_col_letter, price_col_letter,
+                    header_row, fill_method,
+                )
+        except IOError as e:
+            st.error(str(e))
+            st.stop()
     else:
-        prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
+        try:
+            prices = load_prices(uploaded.getvalue(), uploaded.name, header_row, date_col_letter, fill_method, sheet_name)
+        except IOError as e:
+            st.error(str(e))
+            st.stop()
     load_time = st.session_state.get("_last_load_seconds")
     if load_time:
         st.success(f"Loaded and cached to Parquet in {load_time}s. Future recomputes on this file will be instant.")
