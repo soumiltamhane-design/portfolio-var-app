@@ -25,6 +25,7 @@ os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 import time
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,18 @@ CACHE_DIR = Path(".var_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
 
+def _content_key(file_bytes: bytes, filename: str) -> str:
+    """
+    A short hash of the file's actual content + its size, combined with the
+    filename. Using content (not just filename) as the cache key means that
+    re-uploading a file with the same name but different/updated content is
+    correctly treated as new data — the app will never silently serve stale
+    results from an older version of a same-named file.
+    """
+    h = hashlib.md5(file_bytes).hexdigest()[:16]
+    return f"{Path(filename).stem}_{len(file_bytes)}_{h}"
+
+
 # ---------------------------------------------------------------------------
 # File loading with Parquet caching (this is what kills the 246MB problem)
 # ---------------------------------------------------------------------------
@@ -57,7 +70,7 @@ def list_sheet_names(file_bytes: bytes, filename: str) -> list[str]:
     suffix = Path(filename).suffix.lower()
     if suffix not in (".xlsx", ".xlsm"):
         return []
-    tmp_path = CACHE_DIR / f"_peek_{filename}"
+    tmp_path = CACHE_DIR / f"_peek_{_content_key(file_bytes, filename)}"
     tmp_path.write_bytes(file_bytes)
     import openpyxl
     wb = openpyxl.load_workbook(tmp_path, read_only=True, data_only=True)
@@ -85,13 +98,14 @@ def load_prices(file_bytes: bytes, filename: str, header_row: int = 1,
     skip the expensive Excel parse entirely.
     """
     suffix = Path(filename).suffix.lower()
-    cache_key = f"{filename}__s{sheet_name}_h{header_row}_c{date_col_letter}_f{fill_method}"
+    content_key = _content_key(file_bytes, filename)
+    cache_key = f"{content_key}__s{sheet_name}_h{header_row}_c{date_col_letter}_f{fill_method}"
     cache_path = CACHE_DIR / f"{cache_key}.parquet"
 
     if cache_path.exists():
         return pd.read_parquet(cache_path)
 
-    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    tmp_path = CACHE_DIR / f"_raw_{content_key}{suffix}"
     if not tmp_path.exists():
         tmp_path.write_bytes(file_bytes)
 
@@ -161,11 +175,12 @@ def load_prices_long(file_bytes: bytes, filename: str, sheet_name: str,
     """
     import openpyxl
 
-    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    content_key = _content_key(file_bytes, filename)
+    tmp_path = CACHE_DIR / f"_raw_{content_key}{Path(filename).suffix.lower()}"
     if not tmp_path.exists():
         tmp_path.write_bytes(file_bytes)
 
-    cache_key = f"{filename}__long_{sheet_name}_{date_col_letter}_{id_col_letter}_{price_col_letter}_f{fill_method}"
+    cache_key = f"{content_key}__long_{sheet_name}_{date_col_letter}_{id_col_letter}_{price_col_letter}_f{fill_method}"
     cache_path = CACHE_DIR / f"{cache_key}.parquet"
     if cache_path.exists():
         return pd.read_parquet(cache_path)
@@ -238,11 +253,12 @@ def load_long_asof(file_bytes: bytes, filename: str, sheet_name: str,
     import openpyxl
     import datetime as dt
 
-    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    content_key = _content_key(file_bytes, filename)
+    tmp_path = CACHE_DIR / f"_raw_{content_key}{Path(filename).suffix.lower()}"
     if not tmp_path.exists():
         tmp_path.write_bytes(file_bytes)
 
-    cache_key = (f"{filename}__asof_{sheet_name}_{date_col_letter}_{id_col_letter}_"
+    cache_key = (f"{content_key}__asof_{sheet_name}_{date_col_letter}_{id_col_letter}_"
                  f"{price_col_letter}_{as_of_date.date()}_{lookback_years}y_f{fill_method}")
     cache_path = CACHE_DIR / f"{cache_key}.parquet"
     meta_path = CACHE_DIR / f"{cache_key}.heldcount"
@@ -323,7 +339,8 @@ def preview_columns(file_bytes: bytes, filename: str, sheet_name: str, header_ro
     """
     import openpyxl
 
-    tmp_path = CACHE_DIR / f"_raw_{filename}"
+    content_key = _content_key(file_bytes, filename)
+    tmp_path = CACHE_DIR / f"_raw_{content_key}{Path(filename).suffix.lower()}"
     if not tmp_path.exists():
         tmp_path.write_bytes(file_bytes)
 
